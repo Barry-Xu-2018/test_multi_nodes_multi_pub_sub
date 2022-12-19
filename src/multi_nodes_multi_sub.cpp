@@ -14,7 +14,6 @@
 #include "std_msgs/msg/string.hpp"
 
 uint32_t target_number = 0;
-std::atomic_uint32_t current_number = 0;
 
 class NodeSub : public rclcpp::Node
 {
@@ -30,31 +29,26 @@ public:
     RCLCPP_INFO(this->get_logger(), "Connect to topic %s", topic_name.c_str());
     for (uint32_t i = 1; i <= sub_num; i++) {
       auto sub = create_subscription<std_msgs::msg::String>(topic_name, 10, dummy);
+      std::lock_guard<std::mutex> lock(subs_mutex_);
       subs_.emplace_back(sub);
     }
 
     RCLCPP_INFO(this->get_logger(), "Create %u subscriptions --- Done !", sub_num);
 
-    auto callback = [this, sub_num](){
-      for (auto & sub: subs_) {
-        if (sub->get_publisher_count() != 1) {
-          return;
-        }
-      }
-      RCLCPP_INFO(this->get_logger(), "%s: each subscription has one publisher!", this->get_name());
-      this->timer_->cancel();
-      current_number.fetch_add(sub_num, std::memory_order_relaxed);
-      if (current_number == target_number) {
-        RCLCPP_INFO(this->get_logger(), "+++ All subscriptions connect publishers ! +++");
-      }
-    };
+  }
 
-    timer_ = create_wall_timer(std::chrono::milliseconds(500), callback);
+  const std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> & get_subs() {
+    return subs_;
+  }
+
+  uint32_t get_subs_num() {
+    std::lock_guard<std::mutex> lock(subs_mutex_);
+    return subs_.size();
   }
 
 private:
+  std::mutex subs_mutex_;
   std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> subs_;
-  rclcpp::TimerBase::SharedPtr timer_;
 };
 
 void usage(std::string prog_name){
@@ -63,6 +57,38 @@ void usage(std::string prog_name){
   std::cout << "  -s How many subscriptions connected to one topic." << std::endl;
   std::cout << "  -n1s1 1 subscription in 1 node. If no this option, Sub_Num subscription is in one Node." << std::endl;
 }
+
+class NodeCheck : public rclcpp::Node
+{
+public:
+  NodeCheck(std::vector<std::shared_ptr<NodeSub>> & nodes, uint32_t sub_num)
+  : rclcpp::Node("NodeCheck")
+  {
+    auto callback = [this, & nodes, sub_num](){
+      for (auto & node: nodes) {
+        if (node->get_subs_num() != sub_num) {
+          return;
+        }
+      }
+
+      for (auto & node: nodes) {
+        for (auto & sub: node->get_subs()) {
+          if (sub->get_publisher_count() !=1) {
+            RCLCPP_INFO(this->get_logger(), "%s isn't ready", node->get_name());
+            return;
+          }
+        }
+      }
+
+      this->timer_->cancel();
+      RCLCPP_INFO(this->get_logger(), "+++ All subscriptions connect publishers ! +++");
+    };
+
+    timer_ = create_wall_timer(std::chrono::milliseconds(500), callback);
+  }
+private:
+  rclcpp::TimerBase::SharedPtr timer_;
+};
 
 
 int main(int argc, char * argv[])
@@ -94,6 +120,7 @@ int main(int argc, char * argv[])
 
   rclcpp::executors::SingleThreadedExecutor exe;
   std::vector<std::shared_ptr<NodeSub>> nodes;
+  uint32_t sub_num_in_node = 0;
 
   // Set target
   target_number = topic_num * sub_num;
@@ -105,6 +132,7 @@ int main(int argc, char * argv[])
       auto node = std::make_shared<NodeSub>(node_name, topic_name, 1);
       nodes.emplace_back(node);
       exe.add_node(node);
+      sub_num_in_node = 1;
     }
   } else {
     uint32_t node_num = topic_num;
@@ -114,9 +142,12 @@ int main(int argc, char * argv[])
       auto node = std::make_shared<NodeSub>(node_name, topic_name, sub_num);
       nodes.emplace_back(node);
       exe.add_node(node);
+      sub_num_in_node = sub_num;
     }
   }
 
+  auto node_check = std::make_shared<NodeCheck>(nodes, sub_num_in_node);
+  exe.add_node(node_check);
 
   exe.spin();
   nodes.clear();
